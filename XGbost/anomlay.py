@@ -1,152 +1,156 @@
-import pandas as pd
-import joblib
-import os
-from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
+import os, sqlite3, random, time, datetime
+import pandas as pd, numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder
 from sklearn.feature_extraction.text import TfidfVectorizer
-from xgboost import XGBClassifier
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay, precision_score, recall_score, f1_score, roc_auc_score
-from sklearn.utils.multiclass import unique_labels
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import (roc_auc_score, average_precision_score,
+                             confusion_matrix, classification_report)
 import matplotlib.pyplot as plt
+import torch, torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
-MODEL_PATH = "session_rf_model.pkl"
-VEC_PATH = "session_tfidf_vectorizer.pkl"
+# ───────── 설정 ─────────
+RANDOM_SEED     = 42
+TFIDF_MAX_FEAT  = 4000
+HIDDEN_UNITS    = [512, 128, 32]
+DROPOUT         = 0.3
+LR              = 3e-4
+BATCH           = 512
+EPOCHS          = 25
+PATIENCE        = 5
+NORMAL_DB, ATTACK_DB = "normal_data.db", "attack_data.db"
+NORMAL_TABLE, ATTACK_TABLE = "normal_data", "attack_data"
+COL_MAP = {"문장": "sentence", "유형": "ctype"}
+# ───────────────────────
 
-# ✅ 모델 성능 평가 함수
-def evaluate_model_performance(y_true, y_pred, y_proba=None):
-    accuracy = accuracy_score(y_true, y_pred)
-    precision = precision_score(y_true, y_pred, zero_division=0)
-    recall = recall_score(y_true, y_pred, zero_division=0)
-    f1 = f1_score(y_true, y_pred, zero_division=0)
-    roc_auc = roc_auc_score(y_true, y_proba) if y_proba is not None else 0
+def log(msg): print(f"[{datetime.datetime.now():%H:%M:%S}] {msg}")
+def set_seed(s): random.seed(s); np.random.seed(s); torch.manual_seed(s)
+class LogDataset(Dataset):
+    def __init__(self, X, y):
+        self.X, self.y = X, y.values.astype(np.float32)
+    def __len__(self): return self.X.shape[0]
+    def __getitem__(self, idx):
+        dense = torch.tensor(self.X[idx].toarray(), dtype=torch.float32).squeeze(0)
+        return dense, torch.tensor([self.y[idx]], dtype=torch.float32)
 
-    print("\n📊 모델 성능 평가 지표")
-    print(f"✅ Accuracy  : {accuracy:.4f}")
-    print(f"🎯 Precision : {precision:.4f}")
-    print(f"🔍 Recall    : {recall:.4f}")
-    print(f"⚖️  F1-score  : {f1:.4f}")
-    print(f"🚦 ROC-AUC   : {roc_auc:.4f}\n")
+class DenseNet(nn.Module):
+    def __init__(self, in_dim):
+        super().__init__()
+        dims = [in_dim] + HIDDEN_UNITS
+        layers = []
+        for i in range(len(dims)-1):
+            layers += [
+                nn.Linear(dims[i], dims[i+1]),
+                nn.ReLU(True),
+                nn.BatchNorm1d(dims[i+1]),
+                nn.Dropout(DROPOUT)
+            ]
+        layers.append(nn.Linear(dims[-1], 1))
+        self.net = nn.Sequential(*layers)
+    def forward(self, x): return self.net(x)
 
-    return f1 + recall
+def run_epoch(model, loader, crit, optim=None):
+    model.train(optim is not None)
+    total, outs, ys = 0.0, [], []
+    for X, y in loader:
+        X, y = X.to(device), y.to(device)
+        if optim: optim.zero_grad()
+        out = model(X); loss = crit(out, y)
+        if optim: loss.backward(); optim.step()
+        total += loss.item() * len(X)
+        outs.append(out.detach().cpu()); ys.append(y.detach().cpu())
+    return total/len(loader.dataset), torch.cat(outs).numpy(), torch.cat(ys).numpy()
 
-# ✅ 1. 학습 함수 (정상 + 공격 세션 포함)
-def train_model(data_path):
-    print("🔧 모델 학습 시작")
+def metrics(y, p, threshold=0.3):
+    p_sig = 1 / (1 + np.exp(-p))
+    pred  = (p_sig >= threshold).astype(int)
+    roc = roc_auc_score(y, p_sig)
+    pr  = average_precision_score(y, p_sig)
+    cm  = confusion_matrix(y, pred)
+    rep = classification_report(y, pred, digits=3, zero_division=0)
+    return roc, pr, cm, rep, p_sig
 
-    df = pd.read_csv(data_path)
-    df["text"] = df["Method"].fillna('') + " " + df["URL"].fillna('') + " " + df["content"].fillna('') + " " + df["User-Agent"].fillna('')
-    df["session_id"] = df["cookie"].str.extract(r'JSESSIONID=([^;]+)').fillna("no_session")
-    df["session_id"] = (df.index // 20).astype(str)
+def build_preproc():
+    return ColumnTransformer([
+        ("cat", OneHotEncoder(handle_unknown="ignore"), ["ctype"]),
+        ("txt", TfidfVectorizer(analyzer="char", ngram_range=(3,5), max_features=TFIDF_MAX_FEAT), "sentence")
+    ])
 
-    session_data = df.groupby("session_id")["text"].apply(lambda x: " ".join(x)).reset_index()
-    session_data = session_data.merge(
-        df[["session_id", "classification"]].drop_duplicates("session_id"),
-        on="session_id"
-    )
+def load_sql(db, table):
+    with sqlite3.connect(db) as c:
+        df = pd.read_sql_query(f"SELECT * FROM {table}", c)
+    return df.rename(columns=COL_MAP)[["sentence", "ctype"]]
 
-    normal_sessions = [
-        "GET /home HTTP/1.1", "GET /products HTTP/1.1", "GET /cart HTTP/1.1",
-        "POST /checkout HTTP/1.1", "GET /confirmation HTTP/1.1", "GET /profile HTTP/1.1",
-        "POST /update-profile HTTP/1.1", "GET /feedback HTTP/1.1", "GET /search?q=apple HTTP/1.1",
-        "GET /shop/category/electronics HTTP/1.1", "GET /about HTTP/1.1", "GET /contact HTTP/1.1",
-        "GET /cart/item?id=123 HTTP/1.1", "GET /checkout/summary HTTP/1.1",
-        "GET /confirmation/orderid=987 HTTP/1.1", "GET /terms HTTP/1.1", "GET /faq HTTP/1.1",
-        "GET /help HTTP/1.1", "GET /login HTTP/1.1", "GET /logout HTTP/1.1"
-    ]
-    normal_df = pd.DataFrame({
-        "session_id": ["manual_" + str(i) for i in range(len(normal_sessions))],
-        "text": normal_sessions,
-        "classification": [0] * len(normal_sessions)
-    })
-
-    attack_sessions = [
-        ["GET /login.jsp?user=admin&pass=admin HTTP/1.1", "GET /search.jsp?q=1' OR '1'='1 HTTP/1.1", "GET /products?id=10 OR 1=1 HTTP/1.1"],
-        # ... 추가적인 공격 세션
-    ]
-    attack_df = pd.DataFrame({
-        "session_id": [f"attack_{i}" for i in range(len(attack_sessions))],
-        "text": [" ".join(sess if isinstance(sess, list) else [sess]) for sess in attack_sessions],
-        "classification": [1] * len(attack_sessions)
-    })
-
-    session_data = pd.concat([session_data, normal_df, attack_df], ignore_index=True)
-    X = session_data["text"]
-    y = session_data["classification"]
-    stratify = y if y.nunique() >= 2 and y.value_counts().min() >= 2 else None
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=stratify, random_state=42)
-
-    vectorizer = TfidfVectorizer(max_features=5000, ngram_range=(1, 3), analyzer="char")
-    X_train_vec = vectorizer.fit_transform(X_train)
-    X_test_vec = vectorizer.transform(X_test)
-
-    clf = XGBClassifier(eval_metric='logloss', random_state=42)
-
-    # 하이퍼파라미터 튜닝을 위한 그리드 서치
-    param_grid = {
-        'max_depth': [3, 5, 7],
-        'n_estimators': [100, 200, 300],
-        'learning_rate': [0.05, 0.1, 0.15],
-        'subsample': [0.6, 0.8, 1.0],
-        'colsample_bytree': [0.6, 0.8, 1.0],
-        'alpha': [0, 0.01, 0.1],
-        'lambda': [0, 0.01, 0.1]
-    }
-
-    grid_search = GridSearchCV(clf, param_grid, cv=3, n_jobs=-1, verbose=1, scoring='f1')
-    grid_search.fit(X_train_vec, y_train)
-
-    print(f"🧪 최적 하이퍼파라미터: {grid_search.best_params_}")
-
-    best_clf = grid_search.best_estimator_
-    y_pred = best_clf.predict(X_test_vec)
-    y_proba = best_clf.predict_proba(X_test_vec)[:, 1]
-
-    new_score = evaluate_model_performance(y_test, y_pred, y_proba)
-
-    # 모델 저장
-    joblib.dump(best_clf, MODEL_PATH)
-    joblib.dump(vectorizer, VEC_PATH)
-
-    conf_matrix = confusion_matrix(y_test, y_pred)
-    labels = unique_labels(y_test, y_pred)
-    disp = ConfusionMatrixDisplay(confusion_matrix=conf_matrix, display_labels=labels)
-    disp.plot(cmap='Blues', values_format='d')
-    plt.title("Confusion Matrix (XGBoost + TF-IDF + GridSearch)")
-    plt.show()
-
-# ✅ 2. 검증 함수
-def validate_model():
-    if not os.path.exists(MODEL_PATH) or not os.path.exists(VEC_PATH):
-        print("❌ 저장된 모델이 없습니다. 먼저 학습하세요.")
-        return
-
-    clf = joblib.load(MODEL_PATH)
-    vectorizer = joblib.load(VEC_PATH)
-
-    test_sessions = [
-        ["GET /home HTTP/1.1", "GET /products HTTP/1.1", "GET /cart HTTP/1.1", "POST /checkout HTTP/1.1", "GET /products?id=1 OR 1=1 HTTP/1.1"],
-        # ... 테스트 세션
-    ]
-
-    for i, session in enumerate(test_sessions, 1):
-        print(f"\n🧪 테스트 세션 {i}")
-        text = " ".join(session)
-        vec = vectorizer.transform([text])
-        proba = clf.predict_proba(vec)[0]
-        if len(proba) == 2 and proba[1] > 0.7:
-            print(f"🚨 공격 흐름 탐지! (공격 확률: {proba[1]:.2f})")
-        else:
-            print(f"✅ 정상 흐름 판단 (공격 확률: {proba[1] if len(proba)==2 else 'N/A'})")
-
-# ✅ 3. 실행 선택 흐름
+# ───────── main ────────
 if __name__ == "__main__":
-    print("무엇을 할까요?")
-    print("1 - 모델 학습 (정상 + 공격 세션 포함)")
-    print("2 - 모델 검증 (5개 테스트 세션 탐지)")
-    choice = input("선택 (1 or 2): ").strip()
+    set_seed(RANDOM_SEED)
+    base = os.path.dirname(os.path.abspath(__file__))
+    normal = load_sql(os.path.join(base, NORMAL_DB), NORMAL_TABLE)
+    attack = load_sql(os.path.join(base, ATTACK_DB), ATTACK_TABLE)
+    normal["label"] = 0; attack["label"] = 1
 
-    if choice == "1":
-        train_model("C:/Users/leeja/OneDrive/Desktop/anomaly/.venv/csic_database.csv")
-    elif choice == "2":
-        validate_model()
-    else:
-        print("❗ 잘못된 선택입니다.")
+    attack_train = attack.sample(frac=0.05, random_state=RANDOM_SEED)
+    attack_test  = attack.drop(attack_train.index)
+    tr_norm, te_norm = train_test_split(normal, test_size=0.3, random_state=RANDOM_SEED)
+
+    train_df = pd.concat([tr_norm, attack_train], ignore_index=True)
+    test_df  = pd.concat([te_norm, attack_test], ignore_index=True)
+
+    y_tr, y_te = train_df.label, test_df.label
+    X_tr_raw, X_te_raw = train_df.drop("label", axis=1), test_df.drop("label", axis=1)
+
+    pre = build_preproc()
+    X_tr = pre.fit_transform(X_tr_raw)
+    X_te = pre.transform(X_te_raw)
+
+    train_ds, test_ds = LogDataset(X_tr, y_tr), LogDataset(X_te, y_te)
+    ld_tr = DataLoader(train_ds, batch_size=BATCH, shuffle=True)
+    ld_te = DataLoader(test_ds, batch_size=BATCH, shuffle=False)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model  = DenseNet(X_tr.shape[1]).to(device)
+    pos_weight = torch.tensor((len(y_tr)-y_tr.sum())/y_tr.sum(), dtype=torch.float32).to(device)
+    crit = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    opt  = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='max', factor=0.5, patience=2)
+
+    best, wait = 0, 0
+    for ep in range(1, EPOCHS+1):
+        st = time.time()
+        tr_loss, _, _ = run_epoch(model, ld_tr, crit, opt)
+        _, p_te, y_te_ = run_epoch(model, ld_te, crit)
+        roc, pr, cm, _, _ = metrics(y_te_, p_te)
+        log(f"[{ep:02}] loss {tr_loss:.4f} ROC {roc:.3f} PR {pr:.3f} TP {cm[1,1]} FN {cm[1,0]} FP {cm[0,1]} TN {cm[0,0]}")
+        sched.step(pr)
+        if pr > best: best = pr; wait = 0
+        else:
+            wait += 1
+            if wait >= PATIENCE:
+                log("Early stop"); break
+
+    _, p_te, y_te_ = run_epoch(model, ld_te, crit)
+    roc, pr, cm, rep, prob = metrics(y_te_, p_te, threshold=0.3)
+    print("\n=== 최종 평가 지표 (threshold=0.3) ===")
+    print(f"ROC-AUC : {roc:.4f}\nPR-AUC  : {pr:.4f}")
+    print("Confusion Matrix:\n", cm)
+    print("Classification Report:\n", rep)
+
+    print("\n=== 예측 점수 분포 시각화 ===")
+    plt.hist(prob[y_te_==1], bins=100, alpha=0.6, label="Anomalous")
+    plt.hist(prob[y_te_==0], bins=100, alpha=0.6, label="Normal")
+    plt.legend(); plt.title("Model Output Distribution"); plt.show()
+
+    print("\n=== 샘플 로그 예측 ===")
+    sample_logs = [
+        "GET /tienda1/publico/vulnerable.jsp?id=1'or'1'='1 HTTP/1.1",
+        "GET /index.jsp HTTP/1.1"
+    ]
+    sample_df = pd.DataFrame({"sentence": sample_logs, "ctype": ["SQLi?", "Normal?"]})
+    X_sample = pre.transform(sample_df)
+    with torch.no_grad():
+        pred = torch.sigmoid(model(torch.tensor(X_sample.toarray(), dtype=torch.float32).to(device))).cpu().numpy().ravel()
+    for s, p in zip(sample_logs, pred):
+        lbl = "Anomalous" if p >= 0.3 else "Normal"
+        print(f"{lbl:10}  {p:.3f}  |  {s}")
+
